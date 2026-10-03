@@ -5,8 +5,12 @@
 #
 #   pixi run validate/benchmark_spliceai.sh -R /path/hg38.fa -t 16                  # CPU node
 #   pixi run -e gpu validate/benchmark_spliceai.sh -R /path/hg38.fa -t 4 --gpu      # GPU node
+#
+# GPU batch sizes as in brava-annotate: SPLICEAI_B (default 4096) and SPLICEAI_T (default 256, sized for a
+# 40 GB card; try 64 on a 10-12 GB GPU slice if it runs out of memory).
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+SPLICEAI_B=${SPLICEAI_B:-4096}; SPLICEAI_T=${SPLICEAI_T:-256}
 THREADS=4; GPU=0; N_GPU=20000; N_CPU=200; OUT=spliceai_benchmark
 while (( $# )); do
   case $1 in
@@ -81,10 +85,10 @@ fi
 if (( GPU )); then
   subset "1,${N_GPU}p" g.vcf
   t=$SECONDS
-  spliceai -I g.vcf -O g.out.vcf -R "$REF" -A "$ANN" -B 4096 -T 256 -t "$PWD" > g.log 2>&1 \
+  spliceai -I g.vcf -O g.out.vcf -R "$REF" -A "$ANN" -B "$SPLICEAI_B" -T "$SPLICEAI_T" -t "$PWD" > g.log 2>&1 \
     || { tail -5 g.log; echo "GPU SpliceAI failed (log: $PWD/g.log)"; exit 1; }
   tg=$(( SECONDS - t ))
-  report "GPU (-B 4096 -T 256)" "$N_GPU" "$(n_pred g.out.vcf)" "$tg"
+  report "GPU (-B $SPLICEAI_B -T $SPLICEAI_T)" "$N_GPU" "$(n_pred g.out.vcf)" "$tg"
   # Do GPU and CPU agree on the variants both scored?
   python - c1.out.vcf g.out.vcf <<'PY'
 import sys
