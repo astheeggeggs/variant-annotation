@@ -115,12 +115,16 @@ def parse_spliceai_info(info):
     Return [(ENSG id with version, max DS), ...] for a SpliceAI INFO string, e.g.
     SpliceAI=T|SYMBOL---ENSG0123.4---ENST0123---yes---protein_coding---NM_00123.1|0.00|0.01|0.00|0.03|22|0|-2|8
     Multiple comma-separated gene blocks are handled by the 9-field stride, as in the original.
+    SpliceAI writes '.' scores for variants it doesn't score (REF and ALT both longer than 1 bp); these give
+    None (missing, then dropped). The original crashed on them, although its intent was to drop them too.
     """
     fields = info.split("|")
     out = []
     for i in range(len(fields) // 9):
         s = i * 9
-        ds_max = max(float(x) for x in fields[s + 2:s + 6])
+        ds = fields[s + 2:s + 6]
+        # np.max as in the original: it also decides the sign of a zero maximum (SpliceAI writes -0.00)
+        ds_max = None if "." in ds else float(np.max(np.array(ds, dtype=float)))
         out.append((fields[s + 1].split("---")[1], ds_max))
     return out
 

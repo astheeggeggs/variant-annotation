@@ -62,7 +62,7 @@ def make_inputs(d, seed, n_variants=3000, with_cadd=True):
         else:
             blocks = []
             for gene in rng.sample(var_genes + [rng.choice(genes)], rng.choice([1, 1, 2])):
-                ds = [rng.choice(["0.00", "0.01", f"{rng.random():.2f}", "0.20", "0.19"]) for _ in range(4)]
+                ds = [rng.choice(["0.00", "-0.00", "0.01", f"{rng.random():.2f}", "0.20", "0.19"]) for _ in range(4)]
                 dp = [str(rng.randint(-50, 50)) for _ in range(4)]
                 blocks.append(f"{alt}|SYM---{gene}.{rng.randint(1, 20)}---ENST0001---yes---protein_coding---NM_1|"
                               + "|".join(ds + dp))
@@ -99,10 +99,38 @@ def check(seed, with_cadd):
         return saige_a.count("\n") // 2, long_a.count("\n") - 1
 
 
+def check_unscored(seed):
+    """SpliceAI writes '.' scores for variants it doesn't score (REF and ALT both > 1 bp). The original crashes on
+    them; the rewrite must treat them as no SpliceAI information, i.e. match the original given INFO '.'."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        make_inputs(d, seed, with_cadd=False)
+        lines = (d / "spliceai.vcf").read_text().splitlines()
+        rng = random.Random(seed)
+        hit = [i for i, l in enumerate(lines) if "SpliceAI=" in l and rng.random() < 0.2]
+        dots, missing = list(lines), list(lines)
+        for i in hit:
+            f = lines[i].split("\t")
+            gene = f[7].split("|")[1]  # same gene as before, so the unscored block would have matched
+            dots[i] = "\t".join(f[:7] + [f"SpliceAI={f[4]}|{gene}|.|.|.|.|.|.|.|."])
+            missing[i] = "\t".join(f[:7] + ["."])
+        (d / "spliceai.vcf").write_text("\n".join(missing) + "\n")
+        saige_a, long_a = run(ORIGINAL, d, "orig", False)
+        (d / "spliceai.vcf").write_text("\n".join(dots) + "\n")
+        saige_b, long_b = run(NEW, d, "new", False)
+        assert saige_a == saige_b and long_a == long_b, f"unscored SpliceAI records handled differently (seed={seed})"
+        return len(hit)
+
+
 def test_equivalence():
     for seed in range(5):
         for with_cadd in (True, False):
             check(seed, with_cadd)
+
+
+def test_unscored_spliceai():
+    for seed in range(3):
+        check_unscored(seed)
 
 
 if __name__ == "__main__":
@@ -110,3 +138,5 @@ if __name__ == "__main__":
         for with_cadd in (True, False):
             genes, rows = check(seed, with_cadd)
             print(f"seed={seed} cadd={with_cadd}: identical ({genes} genes, {rows} annotated rows)")
+    for seed in range(3):
+        print(f"seed={seed} unscored SpliceAI ('.') records: identical to INFO '.' ({check_unscored(seed)} records)")
