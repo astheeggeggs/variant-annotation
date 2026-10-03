@@ -50,7 +50,8 @@ for (c, p, ref, alt), aas in aa_by_var.items():
             rows.append((c, p, ref, alt, aref, "C" if aalt != "C" else "G", revel(), cadd())); counts["decoy"] += 1
 
 rows.sort(key=lambda r: r[1])  # stable: keeps planted within-position order
-print("#chr\tpos(1-based)\tref\talt\taaref\taaalt\tREVEL_score\tCADD_phred")
+# The VEP dbNSFP plugin refuses a file without an Ensembl_transcriptid column (its value is unused here)
+print("#chr\tpos(1-based)\tref\talt\taaref\taaalt\tEnsembl_transcriptid\tREVEL_score\tCADD_phred")
 for r in rows:
-    print("\t".join(map(str, r)))
+    print("\t".join(map(str, r[:6] + (".",) + r[6:])))
 print(f"{len(aa_by_var)} variants, {len(rows)} rows, planted: {counts}", file=sys.stderr)

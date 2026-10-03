@@ -29,10 +29,11 @@ COPY --from=build /opt/loftee /opt/loftee
 COPY bin /opt/brava/bin
 COPY SAIGE_annotations/scripts /opt/brava/SAIGE_annotations/scripts
 COPY resources /opt/brava/resources
+COPY lib /opt/brava/lib
 # Set the environment directly (no entrypoint) so `apptainer exec` and `docker run` behave the same
 ENV CONDA_PREFIX=/opt/brava/.pixi/envs/${PIXI_ENV} \
     PATH=/opt/brava/bin:/opt/brava/.pixi/envs/${PIXI_ENV}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    PERL5LIB=/opt/loftee \
+    PERL5LIB=/opt/loftee:/opt/brava/lib/perl \
     LOFTEE_PATH=/opt/loftee \
     BRAVA_HOME=/opt/brava \
     LC_ALL=C.UTF-8

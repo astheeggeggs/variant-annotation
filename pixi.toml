@@ -26,7 +26,8 @@ git = "*"
 curl = "*"
 
 [pypi-dependencies]
-# Invitae/geertvandeweyer fork: identical to Illumina SpliceAI 1.3.1 when -B 1, adds GPU batching for -B > 1
+# Invitae/geertvandeweyer fork: same scoring code as Illumina SpliceAI 1.3.1, adds GPU batching for -B > 1.
+# Its -B 1 entry point crashes at this rev (typo), so CPU runs go through bin/spliceai_cpu.py.
 spliceai = { git = "https://github.com/geertvandeweyer/SpliceAI.git", rev = "d23f835dff11326e7a58fb9c522b4b9a7518b19e" }
 
 [feature.gpu]

@@ -118,12 +118,18 @@ make_sites() {
 
 run_vep() {
   local w=$1
-  vep -i "$w/sites.vcf.gz" -o "$w/vep.tmp.vcf.gz" --compress_output bgzip \
+  # lib/perl provides Bio::Perl, which LOFTEE needs and conda's BioPerl 1.7.8 no longer ships
+  PERL5LIB="$BRAVA_HOME/lib/perl${PERL5LIB:+:$PERL5LIB}" vep -i "$w/sites.vcf.gz" -o "$w/vep.tmp.vcf.gz" --compress_output bgzip \
     --vcf --format vcf --assembly GRCh38 --offline --cache --cache_version 105 --dir_cache "$RESOURCES/vep" \
     --canonical --mane --biotype \
     --dir_plugins "$LOFTEE_PATH" \
     --plugin "LoF,loftee_path:$LOFTEE_PATH,human_ancestor_fa:$RESOURCES/human_ancestor.fa.gz,conservation_file:$RESOURCES/loftee.sql,gerp_bigwig:$(gerp_path)" \
     --fork "$THREADS" --no_stats --force_overwrite --quiet
+  # VEP only warns when a plugin fails to load, and would carry on without LoF annotations
+  if ! bcftools view -h "$w/vep.tmp.vcf.gz" | grep -q '^##INFO=<ID=CSQ,.*|LoF|LoF_filter|'; then
+    cat "$w/vep.tmp.vcf.gz_warnings.txt" >&2 2>/dev/null || true
+    die "LOFTEE did not run (no LoF field in the VEP output; see the VEP warnings above)"
+  fi
   mv "$w/vep.tmp.vcf.gz" "$w/vep.vcf.gz"
 }
 
@@ -155,13 +161,15 @@ make_saige() {
 
 run_spliceai() {
   local w=$1 ann=$BRAVA_HOME/resources/$GENCODE_ANNOT ref=$RESOURCES/hg38.fa n
+  # CPU: the fork's own record-by-record loop via spliceai_cpu.py (its `spliceai -B 1` entry point is broken)
+  local cpu=(python "$BRAVA_HOME/bin/spliceai_cpu.py")
   bcftools view -i "ID=@$w/x.spliceai_ids.txt" "$w/sites.vcf.gz" -Ov -o "$w/spliceai_in.vcf"
   n=$(grep -vc '^#' "$w/spliceai_in.vcf" || true)
   if (( GPU )); then
     spliceai -I "$w/spliceai_in.vcf" -O "$w/spliceai.tmp.vcf" -R "$ref" -A "$ann" \
       -B "$SPLICEAI_B" -T "$SPLICEAI_T" -t "$w"
   elif (( n <= 1000 || THREADS == 1 )); then
-    CUDA_VISIBLE_DEVICES="" spliceai -I "$w/spliceai_in.vcf" -O "$w/spliceai.tmp.vcf" -R "$ref" -A "$ann"
+    CUDA_VISIBLE_DEVICES="" "${cpu[@]}" -I "$w/spliceai_in.vcf" -O "$w/spliceai.tmp.vcf" -R "$ref" -A "$ann"
   else
     # Records are scored independently, so splitting into chunks and running them in parallel
     # gives exactly the same output as a single run.
@@ -171,7 +179,7 @@ run_spliceai() {
     for c in "$w"/chunk.[0-9][0-9][0-9]; do
       cat "$w/header.vcf" "$c" > "$c.vcf"
       CUDA_VISIBLE_DEVICES="" TF_NUM_INTRAOP_THREADS=1 TF_NUM_INTEROP_THREADS=1 OMP_NUM_THREADS=1 \
-        spliceai -I "$c.vcf" -O "$c.out.vcf" -R "$ref" -A "$ann" 2> "$c.log" &
+        "${cpu[@]}" -I "$c.vcf" -O "$c.out.vcf" -R "$ref" -A "$ann" 2> "$c.log" &
     done
     wait
     for c in "$w"/chunk.[0-9][0-9][0-9]; do

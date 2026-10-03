@@ -19,7 +19,9 @@ Goal: one short command for analysts, minimal downloads/installs, **same SAIGE g
 | `resources/*.gz/.bgz` | gnomAD popmax list (moved from vep105_loftee) and GENCODE v39 SpliceAI annotation (moved from `data/SpliceAI`) |
 | `maintainer/build_bundle.sh` | builds the bundle (transcript-only VEP cache tar, dbNSFP→REVEL/CADD table, LOFTEE files, MD5SUMS) |
 | `validate/compare.py`, `validate/run_validation.sh` | stage-by-stage comparison against original outputs on BMRC (with comparator self-test) |
-| `validate/local/` | helpers for the local stage-2 test below (mini dbNSFP generator, bigWig query test) |
+| `validate/local/` | local stage-2 test on public data: `stage2.sh WORKDIR` (driver), mini dbNSFP generator, synthetic GERP bigWig, bigWig query test |
+| `lib/perl/Bio/Perl.pm` | `reverse_complement` from BioPerl 1.6.924 for LOFTEE (conda BioPerl 1.7.8 lacks Bio::Perl) |
+| `bin/spliceai_cpu.py` | CPU SpliceAI: the fork's record-by-record loop (the fork's own `-B 1` path crashes) |
 | `tests/` | original script kept as oracle + randomised equivalence test |
 | `Dockerfile`, `pixi.toml`, `pixi.lock`, `.github/workflows/docker.yml` | env/image; CI runs tests and publishes `ghcr.io/<repo>:latest[-gpu]` |
 
@@ -29,9 +31,13 @@ Goal: one short command for analysts, minimal downloads/installs, **same SAIGE g
 - `pixi.lock` solves (linux-64, osx-64; gpu env linux-64 only).
 - Docker image builds (3.6 GB uncompressed). Inside it: VEP 105.0, bcftools/htslib/samtools 1.21, split-vep, LOFTEE perl modules, SpliceAI import with TF/Keras 2.15.
 
+- **Local stage-2 equivalence (2026-10-03)**, `validate/local/stage2.sh` on 12,107 ClinVar chr21 variants (bare `21` names, 28 made multiallelic) with a mini dbNSFP carrying planted edge cases (613 later duplicates, 543 `.`-first rows, 700 decoy aa changes, 379 wrong REF). The slim VEP table is **identical** to the original (`vep --everything`, full cache, real release/105 dbNSFP plugin, LOFTEE, upstream popmax/split-vep): 95,929 rows unfiltered and 93,260 after popmax, 0 mismatches in every column. The same run built the bundle with `build_bundle.sh` and ran `brava-annotate setup --bundle DIR`.
+- **ANC_ALLELE does not depend on input chr naming.** With the ancestral base planted as ALT at all 452 LoF SNVs, the original gives identical LoF/LoF_filter for `chr21` and `21` input (1,712 ANC_ALLELE rows each). VEP passes the cache's contig name to LOFTEE. No real LoF SNV in the sample had an ancestral ALT.
+- Chunked parallel SpliceAI output is byte-identical to a single process (200 variants, 4 chunks).
+
 ## NOT yet verified (in priority order)
-1. **`brava-annotate` has never run end to end.** Expect small bugs in the bash (written, `bash -n` clean only).
-2. **Local stage-2 equivalence test** (was mid-setup). Needs ~25 GB free plus the chr21 VEP cache:
+1. **`brava-annotate` end to end**: setup, sites, VEP+LOFTEE, tables, popmax and CADD (remote prescored tabix) ran on macOS/pixi with bash 5 and GNU coreutils. The SpliceAI and SAIGE steps were still running at handoff (8,775 variants, about 3 h under Rosetta). The Docker image must be **rebuilt and re-checked**: before the Bio::Perl fix, LOFTEE silently did not run in it.
+2. ~~Local stage-2 equivalence test~~ done, see Verified. Setup notes kept for reruns: Needs ~25 GB free plus the chr21 VEP cache:
    - Stream the Ensembl 105 cache and extract only `homo_sapiens/105_GRCh38/{21/*,info.txt,chr_synonyms.txt}` (chr21 arrives late in the tar; ~2 h at 2 MB/s).
    - Test resources: UCSC `chr21.fa` as `hg38.fa`; chr21 of `human_ancestor` (`samtools faidx <https URL> 21`, renamed `21`); `loftee.sql`; a synthetic GERP bigWig for contig `21` (pyBigWig, bioconda). The GERP/ancestor files only need to be identical between the two runs.
    - Input: ClinVar GRCh38 chr21 (`bcftools view -r 21 https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz`), subsampled (~12k).
@@ -42,9 +48,13 @@ Goal: one short command for analysts, minimal downloads/installs, **same SAIGE g
 4. Build the bundle on BMRC (`maintainer/build_bundle.sh`), upload to Zenodo, and set `BUNDLE_URL_DEFAULT`. Check that REVEL/CADD/dbNSFP non-commercial terms allow redistributing the derived table.
 
 ## Findings to carry forward
+- **LOFTEE needs `Bio::Perl`, which the conda BioPerl 1.7.8 packages don't ship.** VEP then only *warns* ("Failed to compile plugin LoF") and writes output with no LoF field. `run_vep` now prepends `lib/perl` to PERL5LIB and dies if the CSQ header lacks `LoF`.
+- **SpliceAI fork `-B 1` path crashes** (`args_output_data` typo in `run_spliceai`, present since c7fd579; the pinned rev is the fork's HEAD). CPU runs go through `bin/spliceai_cpu.py`, which uses the same `spliceai.utils` scoring. The fork's `get_delta_scores` is a refactor of Illumina 1.3.1 with the same arithmetic.
+- The VEP dbNSFP plugin requires an `Ensembl_transcriptid` column in the header (fixed in `make_mini_dbnsfp.py`).
+- `maintainer/build_bundle.sh` was committed without the executable bit (fixed).
+- Under Rosetta, x86 TensorFlow SpliceAI scores about 8 variants/min per process, after a model load of about 2.5 min.
 - **dbNSFP 4.3a download URL in upstream `download_data.sh` is 404.** New cohorts can't reproduce the original, which is what motivates the hosted table.
 - **Remote GERP is not viable.** `Bio::DB::BigWig` only accepts `http:`/`ftp:`, and the bioconda Kent lib has no OpenSSL, so it can't read Broad or Zenodo (https). Plain http works (tested against UCSC), but LOFTEE reopens the file for every exon interval at ~0.5 s per open, so a chromosome would take days. Follow-up idea for an *exact* small GERP: a copy with the same byte layout where data blocks outside protein-coding CDS are replaced by valid empty blocks. END_TRUNC only uses GERP when the variant is ≤50 bp from the last exon. Needs care: LOFTEE queries GERP for every stop-gained/frameshift transcript, and a corrupt block aborts. The file has zoom levels from 40 bp, so a naively re-written subset is *not* exact.
-- **LOFTEE ANC_ALLELE and chr naming:** LOFTEE calls `samtools faidx human_ancestor.fa.gz <seq_region_name>:pos`. That file uses bare contigs (`21`). If VEP passes `chr21` through for chr-prefixed input, ANC_ALLELE silently never fires, and the original's results depend on input chr naming. The pipeline normalises to `chr` (needed for the popmax ID filter). [ASSUMPTION: untested] Test `21` vs `chr21` input and compare `LoF_filter`. Then decide whether to replicate the original (same answer) or fix it (a scientific choice).
 - VEP 105 with `--everything --offline` and no FASTA disables HGVS ("INFO: Disabling --hgvs"). The original therefore ran LOFTEE without a FASTA, so the slim run must **not** pass `--fasta`. `build_bundle.sh` also excludes any FASTA from the cache tar, because VEP auto-loads one.
 - dbNSFP plugin (VEP 105): annotates only missense/stop_gained/stop_lost/start_lost TVAs and SNVs only. It matches `pos`, `alt` and `aaref/aaalt` (X→*) against `Amino_acids`, ignores REF, takes the **first** matching row, and drops `.` values. VEP's VCF writer turns `;`/`,`/`|` into `&`. The python takes the first non-`.` REVEL.
 - VEP cache composition (chrs 1, 10–18 measured): transcript 1.15 GB, regulatory 1.04 GB, variation 3.71 GB. Transcript-only for the whole genome is ~3–3.5 GB of 15.4 GB. Further trim possible: strip SIFT/PolyPhen matrices from the transcript objects (needs validation).
