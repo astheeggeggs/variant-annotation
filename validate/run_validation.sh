@@ -16,6 +16,7 @@
 #   4. CADD prescored lookup vs original CADD scores
 #   5. slim SAIGE file (full SpliceAI, original CADD) vs original-script SAIGE file
 #   6. slim SAIGE file in default mode (SpliceAI subset, prescored CADD only) vs the same reference
+#   7. (information) the original SAIGE file with SpliceAI cutoff 0.5, and with no SpliceAI at all
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); REPO=$(dirname "$HERE")
 THREADS=4; ORIG_CADD=""; GPU=()
@@ -59,6 +60,19 @@ mkdir -p default/$name.work && cp "$w"/sites.vcf.gz* "$w"/vep.vcf.gz default/$na
 time "$REPO/bin/brava-annotate" -r "$RES" -t "$THREADS" "${GPU[@]}" -o default --keep-work "$SITES"
 run "6. SAIGE (default: SpliceAI subset, prescored CADD)" $cmp_py saige ref.saige.txt "default/$name.saige_group.txt"
 [[ -s default/$name.cadd_unscored_indels.vcf ]] && echo "   (relevant indels without prescored CADD: $(grep -vc '^#' default/$name.cadd_unscored_indels.vcf))"
+
+# Information only (not part of the pass/fail): how much does SpliceAI change the original SAIGE file?
+# Same original VEP table and CADD, SpliceAI cutoff 0.5 instead of 0.2, and no SpliceAI at all.
+echo; echo "### 7. (information) effect of SpliceAI on the original SAIGE file"
+echo "  variant-gene pairs per annotation in the original: $(awk '$2 == "anno" {for (i = 3; i <= NF; i++) n[$i]++}
+  END {for (k in n) printf "%s %d; ", k, n[k]}' ref.saige.txt)"
+printf '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n' > no_spliceai.vcf
+python "$REPO/SAIGE_annotations/scripts/brava_create_annot.py" -v "$OVEP" -s "$OSPL" -w cut05.saige.txt \
+  --spliceai_cutoff 0.5 "${cadd[@]}" > cut05.log 2>&1
+python "$REPO/SAIGE_annotations/scripts/brava_create_annot.py" -v "$OVEP" -s no_spliceai.vcf -w nosplice.saige.txt \
+  "${cadd[@]}" > nosplice.log 2>&1
+echo "  -- cutoff 0.2 (original) -> 0.5:"; $cmp_py saige ref.saige.txt cut05.saige.txt | grep -v RESULT || true
+echo "  -- cutoff 0.2 (original) -> no SpliceAI:"; $cmp_py saige ref.saige.txt nosplice.saige.txt | grep -v RESULT || true
 
 echo; (( status == 0 )) && echo "ALL STAGES IDENTICAL" || echo "SOME STAGES DIFFER (see above)"
 exit $status

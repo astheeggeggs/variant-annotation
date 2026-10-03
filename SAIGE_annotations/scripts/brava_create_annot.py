@@ -45,6 +45,9 @@ def parse_args(argv=None):
     parser.add_argument("--spliceai", "-s", help="VCF file with SpliceAI annotations", required=True, type=str)
     parser.add_argument("--out_file", "-w", help="SAIGE output file", required=True, type=str)
     parser.add_argument("--cadd_indels", help="CADD indels file", required=False, type=str)
+    parser.add_argument("--spliceai_cutoff", default=SPLICEAI_CUTOFF, type=float,
+                        help=f"SpliceAI max delta score at or above which a variant counts as damaging "
+                             f"(default {SPLICEAI_CUTOFF}, as in the original)")
 
     # Columns to read (VEP)
     parser.add_argument("--vep_snp_id_col", default="SNP_ID", help="SNPID (chr:pos:ref:alt) column in VEP table")
@@ -79,7 +82,7 @@ def get_annotation(df, args):
     conditions = [
         lof == "HC",
         missense & damaging_score,
-        df["max_DS"] >= SPLICEAI_CUTOFF,
+        df["max_DS"] >= args.spliceai_cutoff,
         lof == "LC",
         missense | inframe,
         other,
