@@ -7,6 +7,9 @@ Stage-by-stage comparison of slim vs original pipeline outputs. Exit code 1 if a
   compare.py saige    ORIG_GROUP NEW_GROUP        SAIGE group files
   compare.py cadd     ORIG_TSV   NEW_TSV          CADD PHRED on shared indels
   compare.py self-test                            comparator must flag planted differences
+
+  --no-examples (any position): print counts only, never variant IDs, genes or scores. Use it wherever the
+  inputs are derived from individual-level data that must not leave the machine (e.g. UKB on BMRC).
 """
 
 import gzip
@@ -127,7 +130,8 @@ def compare_cadd(orig, new, show=5):
     m = a.merge(b, on=["Chrom", "Pos", "Ref", "Alt"], suffixes=("_orig", "_slim"))
     diff = (m["PHRED_orig"].astype(float) - m["PHRED_slim"].astype(float)).abs() > 1e-3
     print(f"CADD indels: original {len(a)}, slim {len(b)}, shared {len(m)}, PHRED differs: {int(diff.sum())}")
-    print(m[diff].head(show).to_string())
+    if show and diff.any():
+        print(m[diff].head(show).to_string())
     return int(diff.sum())
 
 
@@ -160,9 +164,11 @@ def self_test():
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1]
+    args = [a for a in sys.argv[1:] if a != "--no-examples"]
+    show = 5 if len(args) == len(sys.argv) - 1 else 0
+    cmd = args[0]
     fn = {"vep": compare_vep, "spliceai": compare_spliceai, "saige": compare_saige, "cadd": compare_cadd}
-    n = self_test() if cmd == "self-test" else fn[cmd](*sys.argv[2:4])
+    n = self_test() if cmd == "self-test" else fn[cmd](*args[1:3], show=show)
     if cmd == "self-test":
         print("SELF-TEST:", "PASSED" if n == 0 else f"{n} FAILED")
     else:

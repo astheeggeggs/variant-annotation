@@ -28,7 +28,8 @@ while (( $# )); do
   esac
 done
 mkdir -p "$OUT"; cd "$OUT"
-cmp_py="python $REPO/validate/compare.py"
+# counts only: the inputs are UKB-derived and nothing identifying may appear in the pasted-back log
+cmp_py="python $REPO/validate/compare.py --no-examples"
 status=0; run() { echo; echo "### $1"; shift; "$@" || status=1; }
 
 run "0. comparator self-test" $cmp_py self-test
