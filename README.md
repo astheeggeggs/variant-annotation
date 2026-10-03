@@ -1,160 +1,83 @@
 # BRaVa variant annotation
-### Contents
-* [Introduction and pre-processing](#introduction-and-pre-processing)
-* [1. Run VEP version 105 with LOFTEE v1.04_GRCh38](#1-run-vep-version-105-with-loftee-v104_grch38)
-* [2. Run SpliceAI](#2-run-spliceai)
-  * [Batched version (recommended if GPUs are available!)](#batched-version-recommended-if-gpus-are-available)
-  * [SpliceAI Batching parameters](#spliceai-batching-parameters)
-    * [Running batched SpliceAI (with Docker):](#running-batched-spliceai-with-docker)
-    * [Running batched SpliceAI (without Docker):](#running-batched-spliceai-without-docker)
-  * [Vanilla SpliceAI](#vanilla-spliceai)
-    * [Using pip](#using-pip)
-    * [Directly from Illumina's github repository](#directly-from-illuminas-github-repository)
-* [3. Run the Python BRaVa annotation script to extract variant annotations](#3-run-the-python-brava-annotation-script-to-extract-variant-annotations)
 
-## Introduction and pre-processing
-This repository contains all information and scripts required to generate annotation group-files ready to use for group tests in SAIGE-gene, and is split into three steps:
+Turn GRCh38 VCFs into [SAIGE-gene](https://github.com/BRaVa-genetics/universal-saige) group files annotated according to the [BRaVa annotation recommendations](https://docs.google.com/document/d/11Nnb_nUjHnqKCkIB3SQAbR6fl66ICdeA-x_HyGWsBXM/edit#), with one command.
 
-1. Run VEP version 105 with LOFTEE v1.04_GRCh38 (Docker/Singularity provided), and post-process the resultant VEP annotated vcf
-2. Run SpliceAI
-3. Run the Python BRaVa annotation script to extract variant annotations [according to recommendations](https://docs.google.com/document/d/11Nnb_nUjHnqKCkIB3SQAbR6fl66ICdeA-x_HyGWsBXM/edit#), and generate SAIGE annotation group-files
-
-Note, before [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38), ensure that the VCF has split multiallelics, that variant IDs are of the form `CHROM:POS:REF:ALT` (see pre-processing in **step 1** [here](https://github.com/BRaVa-genetics/vep105_loftee#pre-processing) for details), and that you extract sites only vcf files from these, ready for VEP annotation to avoid huge I/O overheads:
-```
-bcftools view --drop-genotypes input.vcf.gz -O z -o sites_only_input.vcf.gz
-```
-where `input.vcf.gz` is your vcf file including genotype information that we wish to annotate, and `sites_only_output.vcf.gz` is the name of the compressed vcf file with all the genotype information from the samples removed.
-
-If you don't have BCFtools (we'd be surprised though), go ahead and install it following the instructions [here](https://samtools.github.io/bcftools/howtos/install.html).
-
-Importantly, we'll need to use a BCFtools plugin (split-vep) at the end of [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38). In order to use the BCFtools plugins, the environment variable `BCFTOOLS_PLUGIN` must be set and point to the correct location:
-
-```
-export BCFTOOLS_PLUGINS=/path/to/bcftools/plugins
+```bash
+git clone https://github.com/BRaVa-genetics/variant-annotation.git && cd variant-annotation
+./run.sh setup -r brava_resources                       # once: ~19 GB (see below)
+./run.sh -r brava_resources -t 16 -o out cohort_chr*.vcf.gz
 ```
 
-(replacing `/path/to/bcftools/plugins` with the path to your BCFtools plugins folder). It may already be set within your compute environment, so make sure to check that first!
+`run.sh` uses whatever you have: Apptainer/Singularity, Docker, or [pixi](https://pixi.sh). Nothing else needs installing.
 
-## 1. Run VEP version 105 with LOFTEE v1.04_GRCh38
+For each input you get `out/<name>.saige_group.txt`, ready for SAIGE-gene, plus:
 
-Complete instructions and code are provided in our [VEP 105 LOFTEE repository](https://github.com/BRaVa-genetics/vep105_loftee). Briefly, the steps are:
+| file | contents |
+| --- | --- |
+| `<name>.saige_group.txt.long.csv.gz` | one row per annotated variant–gene, with every score used |
+| `<name>.vep_processed.txt.gz` | VEP table for all variants (input to the annotation summaries) |
+| `<name>.vep.gnomad_popmax_0.01_processed.txt.gz` | the same table after removing gnomAD popmax > 0.01 variants |
+| `<name>.cadd_unscored_indels.vcf` | only written if some indels need CADD scores (see [CADD for indels](#cadd-for-indels)) |
 
-- Download all of the required resources (cache etc)
-- Run VEP in Docker/Singularity
-- Post-process the file for input into [**step 3**](#3-run-the-python-brava-annotation-script-to-extract-variant-annotations)
+Inputs can be any GRCh38 VCF/BCF: per-chromosome or whole-genome, with or without genotypes, with or without the `chr` prefix, and with multiallelic sites split or not. The pipeline drops genotypes and INFO, splits and left-normalises alleles, and sets IDs to `chr:pos:ref:alt` itself. Interrupted runs resume where they stopped.
 
-Don't forget to run the post-processing step which removes variants with gnomAD [popmax](https://gnomad.broadinstitute.org/help/popmax) > 0.01 and uses the split-vep plugin for BCFtools (this simply splits multiple transcript annotations for a given variant across multiple lines, creating a table with a constant number of columns).
+## What it does
 
-Following completion of [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38) for each of your vcfs, you should have a series of files containing the following columns:
+The steps and versions are the same as the [original pipeline](https://github.com/BRaVa-genetics/variant-annotation/tree/306ab53):
 
-| SNP_ID | GENE | LOF | REVEL_SCORE | CADD_PHRED | CSQ | TRANSCRIPT | MANE_SELECT | CANONICAL | BIOTYPE |
-| ------ | ---- | --- | ----------- | ---------- | --- | ---------- | ----------- | --------- | ------- | 
+1. **VEP 105 + LOFTEE** (GRCh38 branch) for consequences, MANE Select/canonical transcripts and HC/LC pLoF.
+2. **REVEL and CADD (SNVs)** from dbNSFP 4.3a, matched exactly as VEP's dbNSFP plugin matches them.
+3. **gnomAD v2.1.1 popmax > 0.01** variants removed.
+4. **CADD v1.6 for indels**: only in-frame and protein-altering indels can change an annotation, so only those are looked up.
+5. **SpliceAI** with the GENCODE v39/Ensembl 105 annotation. It only scores variants whose annotation SpliceAI can still change; `--all-spliceai` scores everything.
+6. `SAIGE_annotations/scripts/brava_create_annot.py` assigns `pLoF`, `damaging_missense_or_protein_altering`, `other_missense_or_protein_altering`, `synonymous` or `non_coding` per gene. It is the same script as before, now vectorised.
 
-We will use this output, together with the output of [**step 2**](#2-run-spliceai) to define our annotations according to the [recommendations](https://docs.google.com/document/d/11Nnb_nUjHnqKCkIB3SQAbR6fl66ICdeA-x_HyGWsBXM/edit#). Now, let's move onto **step 2**:
+### Why it's smaller and faster but gives the same answer
 
-## 2. Run SpliceAI
-To run SpliceAI we provide two main options: a batched version of SpliceAI that uses GPUs for increased performance, and the original SpliceAI. For each of these options, **please follow our instructions in this repository** rather than those in the various READMEs within the repositories that we link to. This is to ensure that we align to the same gencode and ensembl versions as detailed in our [annotation recommendations](https://docs.google.com/document/d/11Nnb_nUjHnqKCkIB3SQAbR6fl66ICdeA-x_HyGWsBXM/edit#).
+| original | here | why the answer doesn't change |
+| --- | --- | --- |
+| VEP `--everything` + full 15 GB cache | `--canonical --mane --biotype` + transcript-only cache (~3.5 GB) | The other flags add columns BRaVa never reads (AFs, SIFT, HGVS…) or regulatory/miRNA rows that the protein-coding filter drops. Without a FASTA, VEP was already disabling HGVS. |
+| dbNSFP 4.3a (~35 GB, [no longer downloadable](https://dbnsfp.s3.amazonaws.com/dbNSFP4.3a.zip)) via VEP plugin | 2-column table built from the same file | Keeps the first dbNSFP row per (pos, alt, amino-acid change), exactly the row the plugin uses (`pep_match`, ignoring REF), and only for the consequences the plugin annotates. |
+| CADD for every indel (220 GB install) | prescored CADD v1.6 lookup for the few indels that can matter | Only missense-class indels that aren't HC pLoF reach a CADD threshold. Any without a prescored score are written out so you can score them with CADD and supply the result. |
+| SpliceAI on every variant | SpliceAI on variants whose annotation it can change, in parallel chunks | Variants already called pLoF or damaging missense, and variants with no MANE/canonical protein-coding row, can't change. SpliceAI scores each record independently. |
+| popmax filter after VEP | same, applied before SpliceAI/CADD | The filter is by variant ID; nothing upstream depends on other variants. |
+| row-wise pandas `apply` | vectorised | `tests/test_equivalence.py` checks byte-identical output against the original script. |
 
-Note that the required [gencode.v39.ensembl.v105.annotation.txt.gz](https://github.com/BRaVa-genetics/variant-annotation/tree/main/data/SpliceAI) file is hosted in this repository.
+## Resources
 
-### Batched version (recommended if GPUs are available!)
-- This [fork](https://github.com/geertvandeweyer/SpliceAI) is highly recommended as it enables batching of variant annotations on the GPU 
-- CPU performance: ~1k predictions per hour
-- GPU (A100 40GB) performance: ~700k predictions per hour 🚀
+`setup` downloads, once:
 
-#### SpliceAI Batching parameters
-*When setting the batching parameters, be mindful of the system and GPU memory of the machine you are running the script on. Feel free to experiment, but some reasonable -T numbers would be 64/128/256. CPU memory is larger, and increasing -B might further improve performance.*
+| resource | size | source |
+| --- | --- | --- |
+| VEP 105 cache, transcript models only | ~3.5 GB | bundle (or `--vep-cache-from-ensembl`: streams the 15 GB Ensembl tarball and keeps the transcripts) |
+| GERP++ bigWig for LOFTEE | 12.6 GB | bundle |
+| REVEL/CADD table from dbNSFP 4.3a | ~1 GB | bundle |
+| hg38 reference (UCSC) | 1 GB (3 GB unpacked) | UCSC |
+| LOFTEE human ancestor + PhyloCSF | 0.9 GB | bundle |
 
-#### Running batched SpliceAI (with Docker):
-First, navigate to the directory this README is located in. Then, run
-```
-wget http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz -P ./data/
-docker pull cmgantwerpen/spliceai_v1.3
-docker run --gpus all cmgantwerpen/spliceai_v1.3:latest spliceai -I input.vcf -O output.vcf -R ./data/hg38.fa.gz -A ./data/SpliceAI/gencode.v39.ensembl.v105.annotation.txt.gz -B 4096 -T 256
-```
-where `input.vcf` is the name of your (uncompressed) sites only vcf file for splice annotation, and `output.vcf` is is your desired output filename of the resultant annotated uncompressed vcf.
+The original needed ~285 GB. On HPC clusters whose compute nodes have no internet, run `setup` on a login node. A shared copy can be reused by everyone via `-r /shared/brava_resources` or `BRAVA_RESOURCES`.
 
-#### Running batched SpliceAI (without Docker):
-First, navigate to the directory this README is located in. Then, run
-```
-wget http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz -P ./data/
+`--bundle URL_OR_DIR` points `setup` at another copy of the bundle, such as a directory on a shared filesystem.
 
-git clone https://github.com/geertvandeweyer/SpliceAI.git
-cd SpliceAI
-python setup.py install
+## CADD for indels
 
-pip install tensorflow
+SNVs get CADD from dbNSFP. For in-frame and protein-altering indels, `brava-annotate` looks up CADD v1.6 prescored scores remotely (`setup --cadd-prescored local` downloads the 1.2 GB file instead). Any of these indels without a prescored score are written to `<name>.cadd_unscored_indels.vcf`, and the log tells you. Until you supply scores, they are treated as having no CADD score, as in the original pipeline when CADD for indels wasn't run. To match the original exactly, score them with [CADD v1.6](https://github.com/kircherlab/CADD-scripts) (`CADD.sh -g GRCh38 -v v1.6`), or ask the BRaVa team, then rerun with `--cadd-indels scores.tsv.gz` after deleting `<name>.saige_group.txt`.
 
-spliceai -I input.vcf -O output.vcf -R ./data/hg38.fa.gz -A ./data/SpliceAI/gencode.v39.ensembl.v105.annotation.txt.gz -B 4096 -T 256
-```
-where `input.vcf` is the name of your (uncompressed) sites only vcf file for splice annotation and `output.vcf` is your desired output filename of the resultant annotated uncompressed vcf.
+## GPUs
 
-### Vanilla SpliceAI
-#### Using pip
-First, navigate to the directory this README is located in. Then, run
-```
-wget http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz -P ./data/
+`./run.sh --gpu ...` uses the GPU image and batched SpliceAI ([this fork](https://github.com/geertvandeweyer/SpliceAI); identical to Illumina's SpliceAI when unbatched). `SPLICEAI_B`/`SPLICEAI_T` set the batch sizes (default 4096/256). On CPU, SpliceAI runs `-t` processes in parallel, each using about 1 GB of RAM.
 
-pip install spliceai
-pip install tensorflow
-
-spliceai -I input.vcf -O output.vcf -R ./data/hg38.fa.gz -A ./data/SpliceAI/gencode.v39.ensembl.v105.annotation.txt.gz
-```
-where `input.vcf` is the name of your (uncompressed) sites only vcf file for splice annotation and `output.vcf` is your desired output filename of the resultant annotated uncompressed vcf.
-
-#### Directly from Illumina's github repository
-First, navigate to the directory this README is located in. Then, run
-```
-git clone https://github.com/Illumina/SpliceAI.git
-cd SpliceAI
-python setup.py install
-
-pip install tensorflow
-
-spliceai -I input.vcf -O output.vcf -R ./data/hg38.fa.gz -A ./data/SpliceAI/gencode.v39.ensembl.v105.annotation.txt.gz
-```
-where `input.vcf` is the name of your (uncompressed) sites only vcf file for splice annotation and `output.vcf` is your desired output filename of the resultant annotated uncompressed vcf.
-
-Great, now you're here you should have a collection of SpliceAI annotated vcf files, and a collection of tab delimited text files munged from the output of VEP. We can now combine these and generate the annotations for input into gene-based testing in the next step:
-
-## 3. Running CADD for indels
-
-Unfortunately VEP uses cached CADD results and does not support indels so we have to score these ourselves. 
+## Options
 
 ```
-# download cadd
-mkdir -p cadd && wget -O- https://github.com/kircherlab/CADD-scripts/archive/refs/tags/v1.6.post1.tar.gz | tar -xz --strip-components=1 -C cadd
-cd cadd
-
-# download annotations (~3hr, ~200GB)
-wget -c https://krishna.gs.washington.edu/download/CADD/v1.6/GRCh38/annotationsGRCh38_v1.6.tar.gz -P data/annotations
-tar -xzvf data/annotations/annotationsGRCh38_v1.6.tar.gz -C data/annotations
-
-# setup environment (assuming conda >= 4.4.0
-conda create -n cadd python=3.8 snakemake mamba -c conda-forge -c bioconda
-conda activate cadd
-snakemake test/input.tsv.gz --use-conda --conda-create-envs-only --conda-prefix envs --cores 1 --configfile config/config_GRCh38_v1.6.yml --snakefile Snakefile
-
-# process vcf (indel only + strip chr prefix)
-bcftools view -v indels file.vcf.gz -Ov -o file_indelsonly.vcf
-sed 's/^chr//' file_indelsonly.vcf > file_indelsonly_nochrprefix.vcf
-
-# finally you should be able to run CADD!
-
-./cadd.sh file_indelsonly_nochrprefix.vcf
-
+./run.sh --help
 ```
 
-CADD should run at about 30 variants a second, and the output will be a gzipped tsv. 
+## For maintainers
 
-## 4. Run the Python BRaVa annotation script to extract variant annotations
+* `tests/test_equivalence.py` (`pixi run -e test test`): new vs original `brava_create_annot.py` on randomised inputs, plus self-tests of the comparators.
+* `validate/run_validation.sh`: compares every stage against outputs of the original pipeline for one chromosome (VEP table, SpliceAI, CADD, SAIGE file). Run it on BMRC against the existing UKB outputs before tagging a release.
+* `maintainer/build_bundle.sh`: builds the resource bundle from a full install of the original pipeline (VEP cache, dbNSFP 4.3a, LOFTEE data). Upload the output to Zenodo and set `BUNDLE_URL_DEFAULT` in `resources/resources.sh`.
+* The container image (`ghcr.io/brava-genetics/variant-annotation:latest[-gpu]`) is built by GitHub Actions from `pixi.lock`, so the container and pixi installs have identical tool versions.
 
-Pass your processed (tab-delimited) VEP file and your SpliceAI vcf file with the appropriate arguments to generate SAIGE group files ready for analysis in [universal-saige](https://github.com/BRaVa-genetics/universal-saige/).
-
-If you used our instructions for [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38), then you can save a lot of typing and run:
-```
-python SAIGE_annotations/brava_create_annot.py -v vep_table -s spliceai_vcf -w output_file
-```
-where, `vep_table` is the path to the (tab-delimited) VEP annotations text file from the output of [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38) and `spliceai_vcf` is the path to annotated output file from spliceAI in **step 2**, as all of the defaults for the VEP columns are set at the names in the output of [**step 1**](#1-run-vep-version-105-with-loftee-v104_grch38).
-
-Complete usage and requirements are in the [SAIGE_annotations folder](https://github.com/BRaVa-genetics/variant-annotation/tree/main/SAIGE_annotations). Note that this script allows for your own choice of column names for each of the required VEP columns.
+The original step-by-step instructions are in the git history ([`306ab53`](https://github.com/BRaVa-genetics/variant-annotation/tree/306ab53)).

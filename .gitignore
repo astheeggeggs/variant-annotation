@@ -1,0 +1,4 @@
+__pycache__/
+.pixi/
+brava_resources/
+*.work/

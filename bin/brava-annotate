@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# brava-annotate: GRCh38 VCF(s) -> BRaVa SAIGE group files, in one command.
+#
+#   brava-annotate setup [-r RESOURCES]                   # once, on a node with internet
+#   brava-annotate [options] -o OUTDIR in1.vcf.gz [in2.vcf.gz ...]
+#
+# Steps per input (each resumable): sites-only + split/normalise -> VEP 105 + LOFTEE ->
+# REVEL/CADD (slim dbNSFP 4.3a) -> gnomAD popmax filter -> CADD for relevant indels ->
+# SpliceAI for variants it can still change -> SAIGE group file.
+set -euo pipefail
+
+BRAVA_HOME=${BRAVA_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+RESOURCES=${BRAVA_RESOURCES:-$PWD/brava_resources}
+LOFTEE_ENV=${LOFTEE_PATH:-}   # set in the container image
+THREADS=4
+OUTDIR=""
+GPU=0
+ALL_SPLICEAI=0
+KEEP_WORK=0
+CADD_EXTRA=()
+SPLICEAI_B=${SPLICEAI_B:-4096}
+SPLICEAI_T=${SPLICEAI_T:-256}
+
+# shellcheck source=../resources/resources.sh
+source "$BRAVA_HOME/resources/resources.sh"
+
+usage() {
+  cat <<EOF
+Usage:
+  brava-annotate setup [-r DIR] [--bundle URL_OR_DIR] [--cadd-prescored local|remote] [--vep-cache-from-ensembl]
+  brava-annotate [-r DIR] [-t THREADS] [--gpu] [--cadd-indels FILE]... -o OUTDIR VCF [VCF...]
+
+Annotates each (GRCh38, multi- or single-sample, any chr naming) VCF/BCF and writes to OUTDIR:
+  <name>.saige_group.txt            SAIGE-gene group file (var/anno lines per gene)
+  <name>.saige_group.txt.long.csv.gz  one row per annotated variant-gene
+  <name>.vep_processed.txt.gz       VEP table, all variants (for annotation summaries)
+  <name>.vep.gnomad_popmax_0.01_processed.txt.gz
+  <name>.cadd_unscored_indels.vcf   only if some relevant indels have no prescored CADD (see below)
+
+Options:
+  -r, --resources DIR   resource directory (default: \$BRAVA_RESOURCES or ./brava_resources)
+  -o, --out DIR         output directory
+  -t, --threads N       threads for VEP and CPU SpliceAI (default 4; ~1 GB RAM per SpliceAI thread)
+  --gpu                 run SpliceAI batched on GPU(s) (SPLICEAI_B / SPLICEAI_T env override -B / -T)
+  --cadd-indels FILE    CADD v1.6 output (tsv[.gz]) for indels; repeatable. Use this to supply scores
+                        for <name>.cadd_unscored_indels.vcf, then re-run the same command (it resumes).
+  --all-spliceai        score every MANE/canonical variant with SpliceAI, not only those whose annotation
+                        SpliceAI can change (same SAIGE file; fuller max_DS column in the long output)
+  --keep-work           keep intermediate files in OUTDIR/<name>.work
+EOF
+}
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# run a step only if its output is missing (each step writes a temp file and renames on success)
+step() {
+  local out=$1 desc=$2; shift 2
+  if [[ -s $out ]]; then log "  [skip] $desc"; return; fi
+  log "  $desc"
+  "$@"
+}
+
+#--------------------------------------------------------------------------------------------------
+annotate_one() {
+  local in=$1 name w ref=$RESOURCES/hg38.fa
+  name=$(basename "$in"); name=${name%.gz}; name=${name%.bgz}; name=${name%.vcf}; name=${name%.bcf}
+  w=$OUTDIR/$name.work
+  mkdir -p "$w"
+  log "== $name"
+
+  # 1. sites only, chr-prefixed, multiallelics split + left-normalised, ID = CHROM:POS:REF:ALT
+  step "$w/sites.vcf.gz" "sites-only VCF" make_sites "$in" "$w"
+
+  # 2. VEP 105 + LOFTEE (only flags whose output we use; no FASTA, exactly as the original run)
+  step "$w/vep.vcf.gz" "VEP 105 + LOFTEE" run_vep "$w"
+
+  # 3. tables with REVEL/CADD from the slim dbNSFP table; popmax filter; pick SpliceAI/CADD targets
+  step "$w/x.spliceai_ids.txt" "VEP tables + REVEL/CADD" make_tables "$w"
+
+  # 4. CADD for missense-class indels: prescored lookup + any user-supplied CADD output
+  step "$w/cadd_indels.tsv.gz" "CADD indels" run_cadd "$w" "$name"
+
+  # 5. SpliceAI
+  step "$w/spliceai.vcf" "SpliceAI ($(wc -l < "$w/x.spliceai_ids.txt" | tr -d ' ') variants)" run_spliceai "$w"
+
+  # 6. SAIGE group file
+  local cadd_arg=()
+  if [[ $(zgrep -vc '^#' "$w/cadd_indels.tsv.gz" || true) -gt 0 ]]; then cadd_arg=(--cadd_indels "$w/cadd_indels.tsv.gz"); fi
+  step "$OUTDIR/$name.saige_group.txt" "SAIGE group file" make_saige "$w" "$name" "${cadd_arg[@]}"
+
+  for t in vep_processed vep.gnomad_popmax_0.01_processed; do
+    [[ -s $OUTDIR/$name.$t.txt.gz ]] || gzip -c "$w/x.$t.txt" > "$OUTDIR/$name.$t.txt.gz"
+  done
+  if [[ -s $OUTDIR/$name.cadd_unscored_indels.vcf ]] && grep -qv '^#' "$OUTDIR/$name.cadd_unscored_indels.vcf"; then
+    log "  NOTE: $(grep -vc '^#' "$OUTDIR/$name.cadd_unscored_indels.vcf") missense-class indels have no prescored CADD v1.6"
+    log "        score: CADD.sh -g GRCh38 -v v1.6 -o $name.cadd.tsv.gz $OUTDIR/$name.cadd_unscored_indels.vcf"
+    log "        then rerun with --cadd-indels $name.cadd.tsv.gz (and delete $OUTDIR/$name.saige_group.txt)"
+  fi
+  (( KEEP_WORK )) || rm -rf "$w"
+  log "== $name done: $OUTDIR/$name.saige_group.txt"
+}
+
+make_sites() {
+  local in=$1 w=$2 first rename=()
+  first=$(bcftools view -H "$in" 2>/dev/null | head -1 | cut -f1 || true)
+  if [[ $first != chr* ]]; then
+    for c in {1..22} X Y M MT; do printf '%s\tchr%s\n' "$c" "${c/MT/M}"; done > "$w/chr_map.txt"
+    rename=(--rename-chrs "$w/chr_map.txt")
+  fi
+  bcftools view -G --no-version -Ou "$in" \
+    | bcftools annotate --no-version -x INFO "${rename[@]}" -Ou \
+    | bcftools norm --no-version -m-any --check-ref w -f "$RESOURCES/hg38.fa" -Ou 2> "$w/norm.log" \
+    | bcftools annotate --no-version --set-id '%CHROM:%POS:%REF:%FIRST_ALT' -Oz -o "$w/sites.tmp.vcf.gz"
+  bcftools index -t "$w/sites.tmp.vcf.gz"
+  mv "$w/sites.tmp.vcf.gz.tbi" "$w/sites.vcf.gz.tbi"; mv "$w/sites.tmp.vcf.gz" "$w/sites.vcf.gz"
+}
+
+run_vep() {
+  local w=$1
+  vep -i "$w/sites.vcf.gz" -o "$w/vep.tmp.vcf.gz" --compress_output bgzip \
+    --vcf --format vcf --assembly GRCh38 --offline --cache --cache_version 105 --dir_cache "$RESOURCES/vep" \
+    --canonical --mane --biotype \
+    --dir_plugins "$LOFTEE_PATH" \
+    --plugin "LoF,loftee_path:$LOFTEE_PATH,human_ancestor_fa:$RESOURCES/human_ancestor.fa.gz,conservation_file:$RESOURCES/loftee.sql,gerp_bigwig:$(gerp_path)" \
+    --fork "$THREADS" --no_stats --force_overwrite --quiet
+  mv "$w/vep.tmp.vcf.gz" "$w/vep.vcf.gz"
+}
+
+make_tables() {
+  local w=$1
+  bcftools +split-vep "$w/vep.vcf.gz" -d \
+    -f '%CHROM:%POS:%REF:%ALT %Gene %LoF %Consequence %Feature %MANE_SELECT %CANONICAL %BIOTYPE %Amino_acids\n' \
+    -o "$w/vep_raw.txt"
+  python "$BRAVA_HOME/bin/brava_prep.py" vep-tables --raw "$w/vep_raw.txt" --dbnsfp "$RESOURCES/$DBNSFP_TABLE" \
+    --popmax "$BRAVA_HOME/resources/$POPMAX_LIST" --out "$w/x" $( (( ALL_SPLICEAI )) && echo --all-spliceai )
+  rm -f "$w/vep_raw.txt"
+}
+
+run_cadd() {
+  local w=$1 name=$2
+  python "$BRAVA_HOME/bin/brava_prep.py" cadd-prescored --sites "$w/x.cadd_indel_sites.tsv" \
+    --prescored "$(cadd_prescored_path)" "${CADD_EXTRA[@]/#/--extra=}" \
+    --out-tsv "$w/cadd_indels.tmp.tsv.gz" --out-unscored "$OUTDIR/$name.cadd_unscored_indels.vcf"
+  mv "$w/cadd_indels.tmp.tsv.gz" "$w/cadd_indels.tsv.gz"
+}
+
+make_saige() {
+  local w=$1 name=$2; shift 2
+  python "$BRAVA_HOME/SAIGE_annotations/scripts/brava_create_annot.py" \
+    -v "$w/x.vep.gnomad_popmax_0.01_processed.txt" -s "$w/spliceai.vcf" -w "$w/saige.txt" "$@" > "$w/saige.log"
+  mv "$w/saige.txt.long.csv.gz" "$OUTDIR/$name.saige_group.txt.long.csv.gz"
+  mv "$w/saige.txt" "$OUTDIR/$name.saige_group.txt"
+}
+
+run_spliceai() {
+  local w=$1 ann=$BRAVA_HOME/resources/$GENCODE_ANNOT ref=$RESOURCES/hg38.fa n
+  bcftools view -i "ID=@$w/x.spliceai_ids.txt" "$w/sites.vcf.gz" -Ov -o "$w/spliceai_in.vcf"
+  n=$(grep -vc '^#' "$w/spliceai_in.vcf" || true)
+  if (( GPU )); then
+    spliceai -I "$w/spliceai_in.vcf" -O "$w/spliceai.tmp.vcf" -R "$ref" -A "$ann" \
+      -B "$SPLICEAI_B" -T "$SPLICEAI_T" -t "$w"
+  elif (( n <= 1000 || THREADS == 1 )); then
+    CUDA_VISIBLE_DEVICES="" spliceai -I "$w/spliceai_in.vcf" -O "$w/spliceai.tmp.vcf" -R "$ref" -A "$ann"
+  else
+    # Records are scored independently, so splitting into chunks and running them in parallel
+    # gives exactly the same output as a single run.
+    local per=$(( (n + THREADS - 1) / THREADS )) i
+    grep '^#' "$w/spliceai_in.vcf" > "$w/header.vcf"
+    grep -v '^#' "$w/spliceai_in.vcf" | split -l "$per" -d -a 3 - "$w/chunk."
+    for c in "$w"/chunk.[0-9][0-9][0-9]; do
+      cat "$w/header.vcf" "$c" > "$c.vcf"
+      CUDA_VISIBLE_DEVICES="" TF_NUM_INTRAOP_THREADS=1 TF_NUM_INTEROP_THREADS=1 OMP_NUM_THREADS=1 \
+        spliceai -I "$c.vcf" -O "$c.out.vcf" -R "$ref" -A "$ann" 2> "$c.log" &
+    done
+    wait
+    for c in "$w"/chunk.[0-9][0-9][0-9]; do
+      [[ -s $c.out.vcf ]] || { cat "$c.log" >&2; die "SpliceAI chunk $c failed"; }
+    done
+    first=( "$w"/chunk.000.out.vcf )
+    { grep '^#' "${first[0]}"; for c in "$w"/chunk.[0-9][0-9][0-9]; do grep -v '^#' "$c.out.vcf" || true; done; } \
+      > "$w/spliceai.tmp.vcf"
+    rm -f "$w"/chunk.* "$w/header.vcf"
+  fi
+  mv "$w/spliceai.tmp.vcf" "$w/spliceai.vcf"
+}
+
+#--------------------------------------------------------------------------------------------------
+main() {
+  if [[ ${1:-} == setup ]]; then shift; setup_resources "$@"; exit; fi
+  local inputs=()
+  while (( $# )); do
+    case $1 in
+      -r|--resources) RESOURCES=$2; shift 2 ;;
+      -o|--out) OUTDIR=$2; shift 2 ;;
+      -t|--threads) THREADS=$2; shift 2 ;;
+      --gpu) GPU=1; shift ;;
+      --cadd-indels) CADD_EXTRA+=("$(readlink -f "$2")"); shift 2 ;;
+      --all-spliceai) ALL_SPLICEAI=1; shift ;;
+      --keep-work) KEEP_WORK=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option $1 (see --help)" ;;
+      *) inputs+=("$1"); shift ;;
+    esac
+  done
+  (( ${#inputs[@]} )) || { usage; exit 1; }
+  [[ -n $OUTDIR ]] || die "-o OUTDIR is required"
+  check_resources
+  LOFTEE_PATH=${LOFTEE_ENV:-$RESOURCES/loftee}
+  [[ -s $LOFTEE_PATH/LoF.pm ]] || die "LOFTEE not found at $LOFTEE_PATH"
+  mkdir -p "$OUTDIR"
+  for f in "${inputs[@]}"; do [[ -r $f ]] || die "cannot read $f"; done
+  for f in "${inputs[@]}"; do annotate_one "$f"; done
+}
+
+main "$@"
